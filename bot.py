@@ -52,6 +52,52 @@ async def gh_create_file(client: httpx.AsyncClient, path: str, content: str, mes
     r.raise_for_status()
 
 
+async def gh_list_notes(client: httpx.AsyncClient, limit: int = 10) -> list:
+    """List recent note files from _posts/, most recent first."""
+    r = await client.get(
+        f"{GH_API}/repos/{GITHUB_REPO}/contents/_posts",
+        headers=GH_HEADERS, timeout=15,
+    )
+    r.raise_for_status()
+    files = sorted(r.json(), key=lambda f: f["name"], reverse=True)
+    return files[:limit]
+
+
+async def gh_get_file(client: httpx.AsyncClient, path: str) -> dict:
+    """Get a file's content and metadata (including sha)."""
+    r = await client.get(
+        f"{GH_API}/repos/{GITHUB_REPO}/contents/{path}",
+        headers=GH_HEADERS, timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    data["decoded_content"] = base64.b64decode(data["content"]).decode("utf-8")
+    return data
+
+
+async def gh_update_file(client: httpx.AsyncClient, path: str, content: str,
+                         sha: str, message: str):
+    """Update an existing file in the GitHub repo."""
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+        "sha": sha,
+    }
+    r = await client.put(url, headers=GH_HEADERS, json=payload, timeout=15)
+    r.raise_for_status()
+
+
+async def gh_delete_file(client: httpx.AsyncClient, path: str, sha: str, message: str):
+    """Delete a file from the GitHub repo."""
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{path}"
+    r = await client.request(
+        "DELETE", url, headers=GH_HEADERS, timeout=15,
+        json={"message": message, "sha": sha},
+    )
+    r.raise_for_status()
+
+
 # ── URL / metadata helpers ───────────────────────────────────────────────────
 
 URL_RE = re.compile(r"https?://[^\s]+")
@@ -166,6 +212,21 @@ async def fetch_youtube_metadata(client: httpx.AsyncClient, video_id: str) -> di
 
 # ── Post body builders ───────────────────────────────────────────────────────
 
+def build_youtube_embed(video_id: str, title: str) -> str:
+    """Build a responsive YouTube iframe embed."""
+    safe_title = html_mod.escape(title)
+    return (
+        f'{{::nomarkdown}}\n'
+        f'<div class="video-embed">\n'
+        f'<iframe src="https://www.youtube.com/embed/{video_id}" '
+        f'title="{safe_title}" frameborder="0" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+        f'gyroscope; picture-in-picture" allowfullscreen></iframe>\n'
+        f'</div>\n'
+        f'{{:/nomarkdown}}'
+    )
+
+
 def build_preview_card(url: str, meta: dict) -> str:
     """Build an HTML preview card for a URL, similar to messenger link previews.
 
@@ -188,7 +249,7 @@ def build_preview_card(url: str, meta: dict) -> str:
 
     image_html = ""
     if image:
-        image_html = f'  <img src="{image}" alt="" loading="lazy">\n'
+        image_html = f'  <img src="{image}" alt="" loading="lazy" onerror="this.remove()">\n'
 
     desc_html = ""
     if description:
@@ -221,7 +282,8 @@ def slugify(text: str, max_length: int = 50) -> str:
 
 def build_post(title: str, body: str, now: datetime,
                slug_override: Optional[str] = None,
-               description: Optional[str] = None) -> Tuple[str, str]:
+               description: Optional[str] = None,
+               note_type: str = "text") -> Tuple[str, str]:
     """Build a Jekyll post file content and filename.
 
     Returns (filename, file_content).
@@ -239,6 +301,7 @@ def build_post(title: str, body: str, now: datetime,
         f"date: {now:%Y-%m-%d %H:%M:%S} +0000",
         "layout: note",
         "categories: [notes]",
+        f"note_type: {note_type}",
     ]
     if description:
         safe_desc = description.replace('"', '\\"')
@@ -275,33 +338,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if urls:
                 url = urls[0]
 
-                # Fetch metadata
+                # Fetch metadata and build embed/card
                 yt_id = extract_youtube_id(url)
                 if yt_id:
                     meta = await fetch_youtube_metadata(client, yt_id)
+                    fetched_title = meta.get("title") or f"YouTube {yt_id}"
+                    embed = build_youtube_embed(yt_id, fetched_title)
                 else:
                     meta = await fetch_og_metadata(client, url)
+                    fetched_title = meta.get("title") or urlparse(url).netloc or url
+                    embed = build_preview_card(url, meta)
 
-                fetched_title = meta.get("title") or urlparse(url).netloc or url
-                preview_card = build_preview_card(url, meta)
+                ntype = "youtube" if yt_id else "link"
 
                 if non_url_text:
                     # URL + commentary: commentary text + preview card
                     title = non_url_text[:80]
-                    body = f"{non_url_text}\n\n{preview_card}\n"
+                    body = f"{non_url_text}\n\n{embed}\n"
                     filename, content = build_post(
                         title, body, now,
                         slug_override=fetched_title,
                         description=non_url_text,
+                        note_type=ntype,
                     )
                 else:
-                    # URL only: just the preview card
+                    # URL only: just the embed/card
                     title = fetched_title
-                    desc = meta.get("description") or title
-                    body = f"{preview_card}\n"
+                    desc = title
+                    body = f"{embed}\n"
                     filename, content = build_post(
                         title, body, now,
                         description=desc,
+                        note_type=ntype,
                     )
 
                 await gh_create_file(client, filename, content, f"Add note: {title[:60]}")
@@ -326,6 +394,129 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
+async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a note. /delete shows recent notes, /delete N deletes the Nth."""
+    if not update.effective_user or update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    try:
+        async with httpx.AsyncClient() as client:
+            notes = await gh_list_notes(client)
+            if not notes:
+                await update.message.reply_text("No posts found.")
+                return
+
+            args = context.args
+            if not args:
+                # Show recent notes with numbers
+                msg = "Recent posts:\n\n"
+                for i, f in enumerate(notes, 1):
+                    name = f["name"].rsplit(".", 1)[0]  # strip extension
+                    msg += f"{i}. {name}\n"
+                msg += "\nSend /delete N to delete one."
+                await update.message.reply_text(msg)
+                return
+
+            try:
+                idx = int(args[0]) - 1
+                if idx < 0 or idx >= len(notes):
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Invalid number. Use /delete to see the list.")
+                return
+
+            target = notes[idx]
+            await gh_delete_file(
+                client,
+                f"_posts/{target['name']}",
+                target["sha"],
+                f"Delete note: {target['name']}",
+            )
+            await update.message.reply_text(f"Deleted: {target['name']}")
+
+    except Exception as e:
+        log.exception("Failed to delete")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit a note. /edit shows the latest note, /edit <text> replaces its body."""
+    if not update.effective_user or update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    # Everything after "/edit " is the new text
+    new_text = (update.message.text or "").split(None, 1)
+    new_text = new_text[1].strip() if len(new_text) > 1 else ""
+
+    try:
+        async with httpx.AsyncClient() as client:
+            notes = await gh_list_notes(client, limit=1)
+            if not notes:
+                await update.message.reply_text("No posts found.")
+                return
+
+            target = notes[0]
+            file_data = await gh_get_file(client, f"_posts/{target['name']}")
+            old_content = file_data["decoded_content"]
+
+            # Split into front matter and body
+            parts = old_content.split("---", 2)
+            if len(parts) >= 3:
+                front_matter = f"---{parts[1]}---\n\n"
+                old_body = parts[2].strip()
+            else:
+                front_matter = ""
+                old_body = old_content.strip()
+
+            if not new_text:
+                # Show current body (strip any HTML/nomarkdown blocks for readability)
+                display_body = re.sub(
+                    r'\{::nomarkdown\}.*?\{:/nomarkdown\}', '[link preview]',
+                    old_body, flags=re.DOTALL
+                )
+                await update.message.reply_text(
+                    f"Latest note ({target['name']}):\n\n"
+                    f"{display_body}\n\n"
+                    "To edit, send: /edit <new text>\n"
+                    "(Link preview will be preserved)"
+                )
+                return
+
+            # Preserve any {::nomarkdown} embed block (preview card or YouTube)
+            nomarkdown_match = re.search(
+                r'\{::nomarkdown\}.*?\{:/nomarkdown\}',
+                old_body, flags=re.DOTALL,
+            )
+            if nomarkdown_match:
+                preserved_block = nomarkdown_match.group(0)
+                new_body = f"{new_text}\n\n{preserved_block}\n"
+            else:
+                new_body = f"{new_text}\n"
+
+            # Update description in front matter if present
+            if "description:" in front_matter:
+                safe_desc = new_text[:150].replace('"', '\\"')
+                front_matter = re.sub(
+                    r'description: ".*?"', f'description: "{safe_desc}"',
+                    front_matter,
+                )
+
+            new_content = front_matter + new_body
+
+            await gh_update_file(
+                client,
+                f"_posts/{target['name']}",
+                new_content,
+                file_data["sha"],
+                f"Edit note: {target['name']}",
+            )
+            await update.message.reply_text(f"Updated: {target['name']}")
+
+    except Exception as e:
+        log.exception("Failed to edit")
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ALLOWED_USER_ID:
         return
@@ -333,9 +524,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Note Bot ready.\n\n"
         "Send me:\n"
         "- A URL — creates a note with a link preview\n"
+        "- YouTube link — embeds the video\n"
         "- Text + URL — your commentary with a link preview\n"
         "- Plain text — saved as a quick thought\n\n"
-        "Each message becomes a post on your blog."
+        "Commands:\n"
+        "/edit — show the latest note\n"
+        "/edit <text> — replace the latest note's text\n"
+        "/delete — list recent notes\n"
+        "/delete N — delete the Nth note"
     )
 
 
@@ -344,6 +540,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("delete", handle_delete))
+    app.add_handler(CommandHandler("edit", handle_edit))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Note Bot running...")
     app.run_polling(drop_pending_updates=True)

@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# launchd plist (contains local paths)
+*.plist
+
 # Environments
 .env
 .envrc
@@ -205,3 +208,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.DS_Store
