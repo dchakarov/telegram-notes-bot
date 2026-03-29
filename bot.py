@@ -283,10 +283,12 @@ def slugify(text: str, max_length: int = 50) -> str:
 def build_post(title: str, body: str, now: datetime,
                slug_override: Optional[str] = None,
                description: Optional[str] = None,
-               note_type: str = "text") -> Tuple[str, str]:
+               note_type: str = "text",
+               link_meta: Optional[dict] = None) -> Tuple[str, str]:
     """Build a Jekyll post file content and filename.
 
     Returns (filename, file_content).
+    link_meta: optional dict with keys url, title, domain, image for link/youtube posts.
     """
     slug = slugify(slug_override or title)
     # Append HHMM to avoid slug collisions on the same day
@@ -306,6 +308,12 @@ def build_post(title: str, body: str, now: datetime,
     if description:
         safe_desc = description.replace('"', '\\"')
         lines.append(f'description: "{safe_desc}"')
+    if link_meta:
+        lines.append(f'link_url: "{link_meta["url"]}"')
+        lines.append(f'link_title: "{link_meta["title"].replace(chr(34), chr(92)+chr(34))}"')
+        lines.append(f'link_domain: "{link_meta["domain"]}"')
+        if link_meta.get("image"):
+            lines.append(f'link_image: "{link_meta["image"]}"')
     lines.append("---")
     lines.append("")
     lines.append("")
@@ -350,6 +358,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     embed = build_preview_card(url, meta)
 
                 ntype = "youtube" if yt_id else "link"
+                lmeta = {
+                    "url": url,
+                    "title": fetched_title,
+                    "domain": urlparse(url).netloc.replace("www.", ""),
+                    "image": meta.get("image"),
+                }
 
                 if non_url_text:
                     # URL + commentary: commentary text + preview card
@@ -360,6 +374,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         slug_override=fetched_title,
                         description=non_url_text,
                         note_type=ntype,
+                        link_meta=lmeta,
                     )
                 else:
                     # URL only: just the embed/card
@@ -370,6 +385,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         title, body, now,
                         description=desc,
                         note_type=ntype,
+                        link_meta=lmeta,
                     )
 
                 await gh_create_file(client, filename, content, f"Add note: {title[:60]}")
